@@ -51,6 +51,9 @@ two initial states must belong to different basins of attraction.
 * `T_transient = 0.0`: transient time before the algorithm starts saving the edge track.
 * `tmax = Inf`: maximum integration time of parallel trajectories until re-bisection.
 * `Δt = 0.01`: time step passed to [`step!`](@ref) when evolving the two trajectories.
+* `metric = diffnorm` : metric to calculate distance of two point
+* `midpoint_func = (u, v) -> (u + v) / 2` : function for calculating the midpoint of `u` and `v`
+* `displacement_func = (u, v) -> u - v` : function that returns the displacement from `v` to `u`
 * `show_progress = true`: if true, shows progress bar and information while running.
 * `verbose = true`: if false, silences print output and warnings while running.
 * `kw...`: additional keyword arguments to be passed to [`BasinMapProximity`](@ref).
@@ -74,17 +77,17 @@ high-dimensional systems with complicated fractal basin boundary structures.
 The algorithm consists of two main steps: bisection and tracking. First, it iteratively
 bisects along a straight line in state space between the intial states `u1` and `u2` to find
 the separating basin boundary. The bisection stops when the two updated states are less than
-`bisect_thresh` (Euclidean distance in state space) apart from each other.
+`bisect_thresh` (Default is the Euclidean distance in state space) apart from each other.
 Next, a `ParallelDynamicalSystem` is initialized
 from these two updated states and integrated forward until the two trajectories diverge
-from each other by more than `diverge_thresh` (Euclidean distance). The two final states of
+from each other by more than `diverge_thresh` (Default is the Euclidean distance). The two final states of
 the parallel integration are then used as new states `u1` and `u2` for a new bisection, and
 so on, until a stopping criterion is fulfilled.
 
 Two stopping criteria are implemented via the keyword arguments `maxiter` and `abstol`.
 Either the algorithm stops when the number of iterations reaches `maxiter`, or when the
 state space position of the updated edge point changes by less than `abstol` (in
-Euclidean distance) compared to the previous iteration. Convergence below `abstol` happens
+Euclidean distance as the default) compared to the previous iteration. Convergence below `abstol` happens
 after sufficient iterations if the edge state is a saddle point. However, the edge state
 may also be an unstable limit cycle or a chaotic saddle. In these cases, the algorithm will
 never actually converge to a point but (after a transient period) continue populating the
@@ -116,6 +119,9 @@ function edgetracking(
         T_transient = 0.0,
         tmax = Inf,
         Δt = 0.01,
+        metric = diffnorm,
+        midpoint_func = (u, v) -> (u + v) / 2,
+        displacement_func = (u, v) -> u - v,
         show_progress = true,
         verbose = true,
         ϵ_mapper = nothing, # deprecated keyword
@@ -127,7 +133,7 @@ function edgetracking(
 
     return edgetracking(
         pds, bmap;
-        bisect_thresh, diverge_thresh, maxiter, abstol, T_transient, Δt, tmax,
+        bisect_thresh, diverge_thresh, maxiter, abstol, T_transient, Δt, tmax, metric, midpoint_func, displacement_func,
         show_progress, verbose
     )
 end
@@ -143,7 +149,7 @@ for a description, keyword arguments and output type.
 =#
 function edgetracking(
         pds::ParallelDynamicalSystem, bmap::BasinMap;
-        bisect_thresh, diverge_thresh, maxiter, abstol, T_transient, Δt, tmax,
+        bisect_thresh, diverge_thresh, maxiter, abstol, T_transient, Δt, tmax, metric, midpoint_func, displacement_func,
         show_progress, verbose
     )
 
@@ -152,11 +158,11 @@ function edgetracking(
     end
 
     # initial bisection
-    u1, u2, success = bisect_to_edge(pds, bmap; bisect_thresh, verbose)
+    u1, u2, success = bisect_to_edge(pds, bmap; bisect_thresh, metric, midpoint_func, displacement_func, verbose)
     if !success
         return EdgeTrackingResults(nothing)
     end
-    edgestate = (u1 + u2) / 2
+    edgestate = midpoint_func(u1, u2)
     track1, track2 = [u1], [u2]
     time, bisect_idx = Float64[], Int[1]
     progress = ProgressMeter.Progress(
@@ -170,11 +176,11 @@ function edgetracking(
         t = 0
         set_state!(pds, u1, 1)
         set_state!(pds, u2, 2)
-        distance = diffnorm(pds)
+        distance = metric(current_state(pds, 1), current_state(pds, 2))
         # forward integration loop
         while (distance < diverge_thresh) && (t < tmax)
             step!(pds, Δt)
-            distance = diffnorm(pds)
+            distance = metric(current_state(pds, 1), current_state(pds, 2))
             t += Δt
             T += Δt
             if T >= T_transient
@@ -184,13 +190,13 @@ function edgetracking(
             end
         end
         # re-bisect
-        u1, u2, success = bisect_to_edge(pds, bmap; bisect_thresh, verbose)
+        u1, u2, success = bisect_to_edge(pds, bmap; bisect_thresh, metric, midpoint_func, displacement_func, verbose)
         if ~success
             track1 = StateSpaceSet(track1)
             track2 = StateSpaceSet(track2)
 
             return EdgeTrackingResults(
-                StateSpaceSet((track1 .+ track2) ./ 2),
+                StateSpaceSet(midpoint_func.(track1, track2)),
                 track1, track2, time, bisect_idx, false
             )
         end
@@ -198,8 +204,8 @@ function edgetracking(
         if T >= T_transient
             push!(bisect_idx, length(time))
         end
-        displacement = diffnorm(edgestate, (u1 + u2) / 2)
-        edgestate = (u1 + u2) / 2
+        displacement = metric(edgestate, midpoint_func(u1, u2))
+        edgestate = midpoint_func(u1, u2)
         counter += 1
 
         ProgressMeter.next!(
@@ -219,7 +225,7 @@ function edgetracking(
     track2 = StateSpaceSet(track2)
 
     return EdgeTrackingResults(
-        StateSpaceSet((track1 .+ track2) ./ 2),
+        StateSpaceSet(midpoint_func.(track1, track2)),
         track1,
         track2,
         time,
@@ -235,13 +241,16 @@ along a straight line in phase space. The states `u1` and `u2` must belong to di
 basins.
 
 Returns a triple `u1, u2, success`, where `u1, u2` are two new states located on either side
-of the basin boundary that lie less than `bisect_thresh` (Euclidean distance in state space)
+of the basin boundary that lie less than `bisect_thresh` (Euclidean distance in state space as the default)
 apart from each other, and `success` is a Bool indicating whether the bisection was
 successful (it may fail if the `bmap` maps both states to the same basin of attraction,
 in which case a warning is raised).
 
 ## Keyword arguments
-* `bisect_thresh = 1e-7`: The maximum (Euclidean) distance between the two returned states.
+* `bisect_thresh = 1e-7`: The maximum (Euclidean as default) distance between the two returned states.
+* `metric = diffnorm` : metric to calculate distance of two point
+* `midpoint_func = (u, v) -> (u + v) / 2` : function cor calculating the midpoint of u and b
+* `displacement_func = (u, v) -> u - v` : function that returns the displacement from `v` to `u`
 
 ## Description
 `pds` is a `ParallelDynamicalSystem` with two states. The `bmap` must be an
@@ -255,7 +264,8 @@ in which case a warning is raised).
 """
 function bisect_to_edge(
         pds::ParallelDynamicalSystem, bmap::BasinMap;
-        bisect_thresh = 1.0e-6,
+        bisect_thresh = 1.0e-6, metric = diffnorm, midpoint_func = (u, v) -> (u + v) / 2, 
+        displacement_func = (u, v) -> u - v,
         verbose = true
     )
 
@@ -277,9 +287,9 @@ function bisect_to_edge(
         end
     end
 
-    distance = diffnorm(u1, u2)
+    distance = metric(u1, u2)
     while distance > bisect_thresh
-        u_new = (u1 + u2) / 2
+        u_new = midpoint_func(u1, u2)
         idx_new = bmap(u_new)
         # slightly shift u_new if it lands too close to the boundary
         retry_counter = 1
@@ -287,7 +297,7 @@ function bisect_to_edge(
             if verbose
                 @warn "Shifting new point slightly because BasinMap returned -1"
             end
-            u_new += bisect_thresh * (u1 - u2)
+            u_new += bisect_thresh * displacement_func(u1, u2) # ToDO: wrap if necessary
             idx_new = bmap(u_new)
             retry_counter += 1
         end
@@ -307,7 +317,7 @@ function bisect_to_edge(
             end
             u2 = u_new
         end
-        distance = diffnorm(u1, u2)
+        distance = metric(u1, u2)
     end
     return u1, u2, true
 end
